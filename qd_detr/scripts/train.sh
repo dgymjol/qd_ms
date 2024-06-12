@@ -2,7 +2,7 @@ dset_name=hl
 ctx_mode=video_tef
 v_feat_types=slowfast_clip
 t_feat_type=clip 
-results_root=results
+results_root=results_params_test
 exp_id=exp
 
 ######## data paths
@@ -38,7 +38,10 @@ fi
 bsz=32
 
 
-PYTHONPATH=$PYTHONPATH:. python qd_detr/train.py \
+gpunum=1
+
+
+CUDA_VISIBLE_DEVICES=${gpunum} PYTHONPATH=$PYTHONPATH:. python qd_detr/train.py \
 --dset_name ${dset_name} \
 --ctx_mode ${ctx_mode} \
 --train_path ${train_path} \
@@ -50,5 +53,6 @@ PYTHONPATH=$PYTHONPATH:. python qd_detr/train.py \
 --t_feat_dim ${t_feat_dim} \
 --bsz ${bsz} \
 --results_root ${results_root} \
---exp_id ${exp_id} \
+--exp_id "slides" \
+--slide "[3, 6, 18, 76]"
 ${@:1}
