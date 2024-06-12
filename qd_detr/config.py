@@ -67,6 +67,7 @@ class BaseOptions(object):
         parser.add_argument("--max_v_l", type=int, default=75)
         parser.add_argument("--clip_length", type=int, default=2)
         parser.add_argument("--max_windows", type=int, default=5)
+        parser.add_argument("--slide", type=str, default=None)
 
         parser.add_argument("--train_path", type=str, default=None)
         parser.add_argument("--eval_path", type=str, default=None,

@@ -16,6 +16,7 @@ from torch import nn, Tensor
 import math
 import numpy as np
 from .attention import MultiheadAttention
+import os.path 
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -64,7 +65,7 @@ class Transformer(nn.Module):
                  keep_query_pos=False, query_scale_type='cond_elewise',
                  num_patterns=0,
                  modulate_t_attn=True,
-                 bbox_embed_diff_each_layer=False,
+                 bbox_embed_diff_each_layer=False, slide=None
                  ):
         super().__init__()
 
@@ -76,9 +77,9 @@ class Transformer(nn.Module):
 
         # TransformerEncoderLayerThin
         encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+                                                dropout, activation, normalize_before, slide=slide)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
-        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
+        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm, slide=slide, d_model=d_model)
 
         # TransformerDecoderLayerThin
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
@@ -144,20 +145,30 @@ class Transformer(nn.Module):
 
 class TransformerEncoder(nn.Module):
 
-    def __init__(self, encoder_layer, num_layers, norm=None, return_intermediate=False):
+    def __init__(self, encoder_layer, num_layers, norm=None, return_intermediate=False, slide=None, d_model=256):
         super().__init__()
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
         self.return_intermediate = return_intermediate
 
+        if slide is None:
+            self.slides = None
+        else:
+            self.slides = [int(s) for s in slide[1:-1].split(', ')]
+            self.int_mlp = MLP(d_model * len(self.slides), d_model* len(self.slides), d_model, 2)
+
     # for tvsum, add kwargs
     def forward(self, src,
                 mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None, 
                 **kwargs):
         output = src
+
+        if self.slides is not None:
+            output = output.repeat(1, 1, len(self.slides))
+            pos = pos.repeat(1, 1, len(self.slides))
 
         intermediate = []
 
@@ -172,6 +183,9 @@ class TransformerEncoder(nn.Module):
 
         if self.return_intermediate:
             return torch.stack(intermediate)
+        
+        if self.slides is not None:
+            return self.int_mlp(output)
 
         return output
 
@@ -476,9 +490,19 @@ class T2V_TransformerEncoderLayer(nn.Module):
 class TransformerEncoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
+                 activation="relu", normalize_before=False, slide=None):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+
+
+        if slide is None:
+            self.slides = None
+            self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        else:
+            self.slides = [int(s) for s in slide[1:-1].split(', ')]
+            self.self_attns =[ nn.MultiheadAttention(d_model, nhead, dropout=dropout).cuda() for i in range(len(self.slides))]
+            self.d_model = d_model
+            d_model *= len(self.slides)
+
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -492,6 +516,8 @@ class TransformerEncoderLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
 
+
+
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
@@ -501,8 +527,32 @@ class TransformerEncoderLayer(nn.Module):
                      src_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None):
         q = k = self.with_pos_embed(src, pos)
-        src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
+
+        if self.slides is not None:
+
+            src_output = []
+            seqlen, bs = q.shape[0], q.shape[1]
+
+            qs, ks, srcs = torch.split(q, self.d_model, dim=-1), torch.split(k, self.d_model, dim=-1), torch.split(src, self.d_model, dim=-1)
+            for i, slide in enumerate(self.slides):
+                tensor = torch.full(
+                        (seqlen, seqlen),
+                        dtype=q.dtype,
+                        fill_value=1,
+                        device=q.device,
+                    )
+
+                mask = torch.tril(tensor, diagonal=0).to(q.dtype)
+                mask = torch.triu(mask, diagonal=-slide)
+                mask[:, 0] = 1
+                mask[0, :] = 1
+                mask = torch.log(mask)
+                src_output.append(self.self_attns[i](qs[i], ks[i], value=srcs[i], attn_mask=mask,
+                              key_padding_mask=src_key_padding_mask)[0])
+            src2 = torch.cat(src_output, dim=-1)
+        else:
+            src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
+                                key_padding_mask=src_key_padding_mask)[0]
         src = src + self.dropout1(src2)
         src = self.norm1(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
@@ -631,6 +681,52 @@ class TransformerDecoderLayer(nn.Module):
             q_pos = self.ca_qpos_proj(query_pos)
             q = q_content + q_pos
             k = k_content + k_pos
+
+            # for i in range(500):
+            #     a = 500 - i
+            #     if os.path.isfile(f'batch_{a}.pkl'):
+            #         print(f'++++++++++++++++++++++++++  {a}   ++++++++++++++++++++++++++++')
+            #         if os.path.isfile(f'q_cont_{a}.npy'):
+            #             print("second")
+            #         else:
+            #             print("first")
+            #             np.save(f'q_cont_{a}', q_content.cpu().numpy())
+            #             np.save(f'k_cont_{a}', k_content.cpu().numpy())
+            #             np.save(f'q_pos_{a}', q_pos.cpu().numpy())
+            #             np.save(f'k_pos_{a}', k_pos.cpu().numpy())
+
+            #         if os.path.isfile(f'weight_{a}.npy'):
+            #             print("second")
+            #         else:
+            #             print(v.shape)
+            #             print(q_content.shape)
+            #             print(k_content.shape)
+            #             print(memory_key_padding_mask.shape)
+
+            #             _, weight = self.cross_attn(query=q_content,
+            #                     key=k_content,
+            #                     value=v, attn_mask=memory_mask,
+            #                     key_padding_mask=memory_key_padding_mask)
+            #             np.save(f'weight_{a}', weight.cpu().numpy())
+            #         break
+            # for i in range(500):
+            #     a = 500 - i
+            #     if os.path.isfile(f'batch_{a}.pkl'):
+            #         print(f'++++++++++++++++++++++++++  {a}   ++++++++++++++++++++++++++++')
+            #         if os.path.isfile(f'q_cont_{a}.npy'):
+            #             print("second")
+            #         else:
+            #             print("first")
+            #             np.save(f'q_cont_{a}', q_content.cpu().numpy())
+            #             np.save(f'k_cont_{a}', k_content.cpu().numpy())
+            #             np.save(f'q_pos_{a}', q_pos.cpu().numpy())
+            #             np.save(f'k_pos_{a}', k_pos.cpu().numpy())
+            #             _, weight = self.cross_attn(query=q_content,
+            #                    key=k_content,
+            #                    value=v, attn_mask=memory_mask,
+            #                    key_padding_mask=memory_key_padding_mask)
+            #             np.save(f'weight_{a}', weight.cpu().numpy())
+
         else:
             q = q_content
             k = k_content
@@ -643,10 +739,24 @@ class TransformerDecoderLayer(nn.Module):
         k_pos = k_pos.view(hw, bs, self.nhead, n_model // self.nhead)
         k = torch.cat([k, k_pos], dim=3).view(hw, bs, n_model * 2)
 
-        tgt2 = self.cross_attn(query=q,
+        tgt2, attn_weights = self.cross_attn(query=q,
                                key=k,
                                value=v, attn_mask=memory_mask,
-                               key_padding_mask=memory_key_padding_mask)[0]
+                               key_padding_mask=memory_key_padding_mask)
+        
+        # for i in range(500):
+        #     a = 500 - i
+        #     if os.path.isfile(f'batch_{a}.pkl'):
+        #         print(f'=============================  {a}   =============================')
+        #         if os.path.isfile(f'attn_weights_{a}.npy'):
+        #             print("second")
+        #             np.save(f'attn_weights_{a}_2.npy', attn_weights.cpu().numpy())
+        #         else:
+        #             print("first")
+        #             np.save(f'attn_weights_{a}.npy', attn_weights.cpu().numpy())
+        #         break
+
+
         # ========== End of Cross-Attention =============
 
         tgt = tgt + self.dropout2(tgt2)
@@ -774,6 +884,7 @@ def build_transformer(args):
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,
         activation='prelu',
+        slide=args.slide
     )
 
 
