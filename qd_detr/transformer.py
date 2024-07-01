@@ -523,7 +523,8 @@ class TransformerEncoderLayer(nn.Module):
         
             masks = []
             for slide in self.slides:
-                mask = torch.tril(tensor, diagonal=0).to(q.dtype)
+                # mask = torch.tril(tensor, diagonal=0).to(q.dtype) # casual
+                mask = torch.tril(tensor, diagonal=slide).to(q.dtype)
                 mask = torch.triu(mask, diagonal=-slide)
                 mask[:, 0] = 1
                 mask[0, :] = 1

@@ -53,6 +53,6 @@ CUDA_VISIBLE_DEVICES=${gpunum} PYTHONPATH=$PYTHONPATH:. python qd_detr/train.py 
 --t_feat_dim ${t_feat_dim} \
 --bsz ${bsz} \
 --results_root ${results_root} \
---exp_id "slides" \
---slide "[3, 6, 18, 76]"
+--exp_id "no_casual" \
+--slide "[1, 5, 10, 37]"
 ${@:1}
